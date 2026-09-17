@@ -9,40 +9,47 @@
 (() => {
   "use strict";
 
-  // Endpoint resolution precedence:
-  //   1. ?agent=<url>      — overrides and persists to localStorage. ?agent=reset clears.
-  //   2. localStorage      — sticky across reloads once set via the query param.
-  //   3. window.GRAND_MERIDIAN_AGENT_URL (set in index.html, the committed default).
-  //   4. http://localhost:8000/chat.
-  // Demo flow: paste `?agent=<deployed-url>` once, reload — sticks until ?agent=reset.
-  const ENDPOINT = (() => {
-    const LS_KEY = "gmAgentUrl";
-    const fallback = window.GRAND_MERIDIAN_AGENT_URL || "http://localhost:8000/chat";
-    let fromQuery = null;
-    try {
-      fromQuery = new URLSearchParams(window.location.search).get("agent");
-    } catch (_) {}
-    if (fromQuery === "reset") {
-      try { localStorage.removeItem(LS_KEY); } catch (_) {}
-      return fallback;
-    }
-    if (fromQuery) {
-      try { new URL(fromQuery); } catch (_) { return fallback; }
-      try { localStorage.setItem(LS_KEY, fromQuery); } catch (_) {}
-      return fromQuery;
-    }
-    try {
-      const stored = localStorage.getItem(LS_KEY);
-      if (stored) { new URL(stored); return stored; }
-    } catch (_) {}
-    return fallback;
-  })();
+  // Two backend agents, routed per message by intent, so one conversation
+  // hands off between them — the point being to watch both show up as
+  // separate traces in Agent Manager. Override via window.GRAND_MERIDIAN_*
+  // (set in index.html) for pointing at a different deployment.
+  const AVAILABILITY_URL =
+    window.GRAND_MERIDIAN_AVAILABILITY_URL ||
+    "http://default-default.am-gateway.localhost:19080/concierge-reader-only/chat";
+  const BOOKING_URL =
+    window.GRAND_MERIDIAN_BOOKING_URL ||
+    "http://default-default.am-gateway.localhost:19080/concierge-full-access/chat";
+
+  // Naive keyword classifier — good enough for a scripted demo. Two cases:
+  //   1. The message itself names the intent ("book", "booking", "reserve",
+  //      "reservation" — word-stem match, not just the bare word, so
+  //      "confirm the booking" and "I'd like to reserve" both count).
+  //   2. The availability agent just asked something like "would you like to
+  //      book this room?" and the guest replies with a bare confirmation
+  //      ("yes", "go ahead", "sounds good") that names no keyword at all —
+  //      tracked via awaitingBookingConfirmation, set after every reply.
+  // Anything else routes to the availability agent.
+  const BOOKING_STEM = /\bbook(ing|ed|s)?\b|\breserv(e|ed|ing|ation)\b/i;
+  const BOOKING_INVITE = /\b(would you like|shall i|do you want).{0,30}\bbook\b|\bbook (this|the) room\b|\blike (me )?to book\b/i;
+  const AFFIRMATIVE = /^\s*(yes|yeah|yep|yup|sure|please( do)?|go ahead|confirm(ed)?|sounds good|that works|do it|ok(ay)?|correct)\b/i;
+
+  let awaitingBookingConfirmation = false;
+
+  function classifyIntent(text) {
+    if (BOOKING_STEM.test(text)) return "booking";
+    if (awaitingBookingConfirmation && AFFIRMATIVE.test(text)) return "booking";
+    return "availability";
+  }
+
+  const AGENT_LABEL = { booking: "Booking Agent", availability: "Availability Agent" };
+  const AGENT_URL = { booking: BOOKING_URL, availability: AVAILABILITY_URL };
+
   const PANEL_W = 380;
   const PANEL_H = 560;
 
   const GREETING =
-    "Welcome to The Grand Meridian. How can I help you today? I can check availability, share our menus, or recommend something nearby.";
-  const CHIPS = ["Check availability", "Room service", "Things to do nearby"];
+    "Welcome to The Grand Meridian. How can I help you today? I can check availability, make a booking, share our menus, or recommend something nearby.";
+  const CHIPS = ["Check availability", "Book a room", "Room service", "Things to do nearby"];
 
   // One session per page load. Server tracks conversation state keyed by this id.
   const SESSION_ID =
@@ -182,6 +189,9 @@
 
   function renderBot(text, opts = {}) {
     const isGreeting = !!opts.greeting;
+    const label = opts.agentLabel
+      ? `<div style="font-size:10px;letter-spacing:0.08em;text-transform:uppercase;color:#9a9a9a;margin-bottom:5px;">${escapeHtml(opts.agentLabel)}</div>`
+      : "";
     const bubble = el(
       "div",
       `max-width:85%;padding:12px 14px;font-size:14px;line-height:1.5;
@@ -189,7 +199,7 @@
        border-radius:2px 14px 14px 14px;`,
       isGreeting
         ? `<div style="font-family:'Playfair Display',serif;font-size:15px;font-weight:600;color:#1B2B4B;margin-bottom:4px;">Welcome to The Grand Meridian.</div>${escapeHtml(text.replace("Welcome to The Grand Meridian. ", ""))}`
-        : `<div class="cm-md">${renderMarkdown(text)}</div>`
+        : `${label}<div class="cm-md">${renderMarkdown(text)}</div>`
     );
     // Make rendered links open in a new tab without leaking the opener.
     bubble.querySelectorAll("a[href]").forEach((a) => {
@@ -302,19 +312,29 @@
     send(text);
   });
 
+  // Full transcript across BOTH agents, resent as context.history on every
+  // request — this is what lets the receiving agent pick up mid-conversation
+  // even the first time it sees this session_id (see agent.py's history-seed
+  // logic), so switching agents mid-thread doesn't lose context.
+  const transcript = [];
+
   async function send(text) {
     renderUser(text);
     setSendingState(true);
     const typing = renderTyping();
 
+    const intent = classifyIntent(text);
+    const endpoint = AGENT_URL[intent];
+    const agentLabel = AGENT_LABEL[intent];
+
     try {
-      const res = await fetch(ENDPOINT, {
+      const res = await fetch(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           message: text,
           session_id: SESSION_ID,
-          context: {},
+          context: { history: transcript },
         }),
       });
       typing.remove();
@@ -325,7 +345,9 @@
       }
       const data = await res.json();
       const reply = (data && data.response) || "I'm having trouble — could you try again?";
-      renderBot(reply);
+      transcript.push({ role: "user", content: text }, { role: "assistant", content: reply });
+      awaitingBookingConfirmation = intent === "availability" && BOOKING_INVITE.test(reply);
+      renderBot(reply, { agentLabel });
     } catch (err) {
       typing.remove();
       console.warn("widget send failed", err);
