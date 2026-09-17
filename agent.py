@@ -24,6 +24,7 @@ from collections import defaultdict
 from contextlib import asynccontextmanager
 from typing import Any
 
+import httpx
 import requests
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -52,6 +53,12 @@ OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o")
 MAX_SESSION_MESSAGES = 40
 FRIENDLY_FALLBACK = (
     "I'm having trouble reaching our systems right now — could you try that again in a moment?"
+)
+# Surfaced when a tool call comes back 401/403 — i.e. this agent's identity
+# isn't scoped for the action, not a transient outage. Distinct from
+# FRIENDLY_FALLBACK so a permission gap doesn't read as "try again later".
+ACCESS_DENIED_FALLBACK = (
+    "I'm unable to facilitate this request. Please get in touch with the front desk for help."
 )
 
 # In-memory session store. Single-process scope. Multi-replica deploys would
@@ -330,6 +337,13 @@ async def chat(req: ChatRequest) -> ChatResponse:
         except APIError as e:
             log.warning("session=%s openai api error: %s", sid, e)
             reply = FRIENDLY_FALLBACK
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code in (401, 403):
+                log.warning("session=%s tool call denied by gateway: %s", sid, e)
+                reply = ACCESS_DENIED_FALLBACK
+            else:
+                log.warning("session=%s tool call http error: %s", sid, e)
+                reply = FRIENDLY_FALLBACK
         except Exception as e:
             log.exception("session=%s unhandled error in /chat: %s", sid, e)
             reply = FRIENDLY_FALLBACK
