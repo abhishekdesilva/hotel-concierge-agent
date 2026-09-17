@@ -7,7 +7,12 @@ httpx>=0.27.0
 langgraph>=1.1,<2.0
 langchain-openai>=1.2,<2.0
 langchain-core>=1.3,<2.0
-langchain-mcp-adapters>=0.1.0
+# Pinned exactly (not >=) — an open range here makes pip re-resolve mcp's
+# version jointly with traceloop-sdk's whole opentelemetry-instrumentation-*
+# matrix from scratch, which backtracks for a very long time. 0.3.2 is the
+# version verified locally to resolve instantly against the traceloop-sdk
+# pin above (pulls mcp==1.30.0).
+langchain-mcp-adapters==0.3.2
 requests>=2.32.0
 # Pinned to match amp-instrumentation's transitive resolution. tracing.py
 # calls Traceloop.init() ourselves after disabling Agent Manager's auto-
