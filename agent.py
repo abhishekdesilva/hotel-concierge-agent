@@ -14,6 +14,7 @@ unhandled exceptions return a friendly fallback rather than 500-ing.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -23,9 +24,12 @@ from collections import defaultdict
 from contextlib import asynccontextmanager
 from typing import Any
 
+import requests
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
+from langchain_core.tools import tool
+from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_openai import ChatOpenAI
 from langgraph.errors import GraphRecursionError
 from langgraph.prebuilt import create_react_agent
@@ -33,7 +37,10 @@ from openai import APIError, RateLimitError
 from pydantic import BaseModel
 
 from system_prompt import SYSTEM_PROMPT
-from tools import LANGCHAIN_TOOLS
+from tools import get_local_recommendations, get_room_service_menu
+
+# Local (non-MCP) tools — always available regardless of MCP proxy config.
+_LOCAL_TOOLS = [tool(get_room_service_menu), tool(get_local_recommendations)]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("concierge")
@@ -53,6 +60,71 @@ SESSIONS: dict[str, list[BaseMessage]] = {}
 SESSION_LOCKS: dict[str, threading.Lock] = defaultdict(threading.Lock)
 
 _agent = None
+_agent_lock = asyncio.Lock()
+
+# Env var name for the hotel-tools MCP proxy's URL, injected by Agent Manager
+# once the Tool Configuration is attached (see docs/guides/configure-agent-mcp-proxies).
+# Fixed AMP_AGENTID_* vars are injected alongside it automatically.
+HOTEL_TOOLS_MCP_URL_VAR = "HOTEL_TOOLS_URL"
+
+
+def _mint_mcp_token(mcp_server_url: str) -> str | None:
+    """Client-credentials grant against this agent's AgentID identity, scoped
+    to mcp_server_url via RFC 8707's `resource` param. The token's scopes are
+    filtered server-side to whatever roles are assigned to this agent's
+    identity — a different agent hitting the same proxy can get a token with
+    fewer scopes, which is the whole point of the demo.
+
+    Returns None (not raises) on any failure so a missing/misconfigured proxy
+    degrades to "no MCP tools available" rather than crashing agent startup.
+    """
+    client_id = os.environ.get("AMP_AGENTID_CLIENT_ID")
+    client_secret = os.environ.get("AMP_AGENTID_CLIENT_SECRET")
+    token_endpoint = os.environ.get("AMP_AGENTID_TOKEN_ENDPOINT")
+    scopes = os.environ.get("AMP_AGENTID_SCOPES", "")
+    if not (client_id and client_secret and token_endpoint):
+        log.warning("AgentID env vars not set — skipping MCP tool discovery")
+        return None
+    try:
+        resp = requests.post(
+            token_endpoint,
+            auth=(client_id, client_secret),
+            data={"grant_type": "client_credentials", "scope": scopes, "resource": mcp_server_url},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()["access_token"]
+    except Exception as e:
+        log.warning("failed to mint AgentID token for MCP proxy: %s", e)
+        return None
+
+
+async def _get_mcp_tools() -> list[Any]:
+    """Fetch check_room_availability + book_room from the hotel-tools MCP
+    proxy, authenticated as this agent's identity. Returns [] (never raises)
+    if the proxy isn't configured for this environment/agent — the agent
+    still runs, just without room lookup/booking."""
+    mcp_url = os.environ.get(HOTEL_TOOLS_MCP_URL_VAR, "").strip()
+    if not mcp_url:
+        log.warning("%s not set — MCP tools unavailable", HOTEL_TOOLS_MCP_URL_VAR)
+        return []
+    token = _mint_mcp_token(mcp_url)
+    if not token:
+        return []
+    try:
+        client = MultiServerMCPClient(
+            {
+                "hotel_tools": {
+                    "url": mcp_url,
+                    "transport": "streamable_http",
+                    "headers": {"Authorization": f"Bearer {token}"},
+                }
+            }
+        )
+        return await client.get_tools()
+    except Exception as e:
+        log.warning("failed to fetch MCP tools from %s: %s", mcp_url, e)
+        return []
 
 
 def _resolve_llm_config() -> dict[str, Any]:
@@ -116,17 +188,24 @@ def _debug_http_client():
     return httpx.Client(event_hooks={"response": [_log_response]}, timeout=60.0)
 
 
-def _get_agent():
-    """Lazy so the module imports cleanly with no keys set (CI, linters,
-    /health smoke tests). ChatOpenAI reads credentials on first instantiation,
-    not at import time."""
+async def _get_agent():
+    """Lazy + cached so the module imports cleanly with no keys set (CI,
+    linters, /health smoke tests), and so MCP tool discovery (a network call)
+    happens once rather than per-request. ChatOpenAI reads credentials on
+    first instantiation, not at import time."""
     global _agent
-    if _agent is None:
-        cfg = _resolve_llm_config()
-        if (client := _debug_http_client()) is not None:
-            cfg["http_client"] = client
-        llm = ChatOpenAI(model=OPENAI_MODEL, **cfg)
-        _agent = create_react_agent(llm, tools=LANGCHAIN_TOOLS, prompt=SYSTEM_PROMPT)
+    if _agent is not None:
+        return _agent
+    async with _agent_lock:
+        if _agent is None:  # re-check: another request may have won the race
+            cfg = _resolve_llm_config()
+            if (client := _debug_http_client()) is not None:
+                cfg["http_client"] = client
+            llm = ChatOpenAI(model=OPENAI_MODEL, **cfg)
+            mcp_tools = await _get_mcp_tools()
+            all_tools = _LOCAL_TOOLS + mcp_tools
+            log.info("agent tools loaded: %s", [t.name for t in all_tools])
+            _agent = create_react_agent(llm, tools=all_tools, prompt=SYSTEM_PROMPT)
     return _agent
 
 
@@ -212,7 +291,7 @@ def _final_text(messages: list[BaseMessage]) -> str:
 
 
 @app.post("/chat", response_model=ChatResponse)
-def chat(req: ChatRequest) -> ChatResponse:
+async def chat(req: ChatRequest) -> ChatResponse:
     started = time.perf_counter()
 
     if not req.message.strip():
@@ -232,7 +311,8 @@ def chat(req: ChatRequest) -> ChatResponse:
             log.info("session=%s context=%s", sid, json.dumps(req.context)[:500])
 
         try:
-            result = _get_agent().invoke(
+            agent = await _get_agent()
+            result = await agent.ainvoke(
                 {"messages": history},
                 config={
                     "configurable": {"thread_id": sid},
