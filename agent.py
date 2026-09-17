@@ -324,12 +324,32 @@ async def chat(req: ChatRequest) -> ChatResponse:
 
     with SESSION_LOCKS[sid]:
         history = SESSIONS.get(sid, [])
+
+        # A multi-agent frontend (e.g. one agent for availability, another for
+        # booking) hands a session off mid-conversation by resending the
+        # transcript so far as context.history. Seed from it only the first
+        # time *this* backend sees the session — its own SESSIONS store is
+        # authoritative once that happens.
+        if not history and req.context:
+            seed = req.context.get("history")
+            if isinstance(seed, list):
+                for turn in seed:
+                    if not isinstance(turn, dict):
+                        continue
+                    content = turn.get("content")
+                    if not content:
+                        continue
+                    if turn.get("role") == "user":
+                        history.append(HumanMessage(content=content))
+                    elif turn.get("role") == "assistant":
+                        history.append(AIMessage(content=content))
+                if history:
+                    log.info("session=%s seeded %d messages from context.history", sid, len(history))
+
         history = history + [HumanMessage(content=req.message)]
 
-        # `context` is accepted per the contract but not currently injected
-        # into the prompt. Logged here so it surfaces in the trace.
         if req.context:
-            log.info("session=%s context=%s", sid, json.dumps(req.context)[:500])
+            log.info("session=%s context keys=%s", sid, list(req.context.keys()))
 
         try:
             agent = await _get_agent()
