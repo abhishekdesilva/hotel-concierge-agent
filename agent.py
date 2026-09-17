@@ -268,6 +268,20 @@ def health() -> dict[str, Any]:
     return _ready_payload()
 
 
+def _find_http_status_error(exc: BaseException) -> httpx.HTTPStatusError | None:
+    """A denied MCP tool call surfaces as httpx.HTTPStatusError, but anyio's
+    task groups (inside the streamable-HTTP client) wrap it in a
+    BaseExceptionGroup before it reaches here — search recursively."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc
+    if isinstance(exc, BaseExceptionGroup):
+        for sub in exc.exceptions:
+            found = _find_http_status_error(sub)
+            if found is not None:
+                return found
+    return None
+
+
 def _truncate(history: list[BaseMessage]) -> list[BaseMessage]:
     """Keep the most recent messages, but never start the slice on a
     ToolMessage (would be orphaned without its preceding AIMessage tool_calls
@@ -337,16 +351,14 @@ async def chat(req: ChatRequest) -> ChatResponse:
         except APIError as e:
             log.warning("session=%s openai api error: %s", sid, e)
             reply = FRIENDLY_FALLBACK
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code in (401, 403):
-                log.warning("session=%s tool call denied by gateway: %s", sid, e)
+        except Exception as e:
+            denied = _find_http_status_error(e)
+            if denied is not None and denied.response.status_code in (401, 403):
+                log.warning("session=%s tool call denied by gateway: %s", sid, denied)
                 reply = ACCESS_DENIED_FALLBACK
             else:
-                log.warning("session=%s tool call http error: %s", sid, e)
+                log.exception("session=%s unhandled error in /chat: %s", sid, e)
                 reply = FRIENDLY_FALLBACK
-        except Exception as e:
-            log.exception("session=%s unhandled error in /chat: %s", sid, e)
-            reply = FRIENDLY_FALLBACK
 
         SESSIONS[sid] = _truncate(history)
 
