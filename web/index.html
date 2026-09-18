@@ -42,9 +42,18 @@
 </style>
 <!-- Configure the orchestrator agent's endpoint. It decides internally which
      of the two scope-gated concierge agents should handle each message and
-     delegates to it — the widget only ever talks to this one endpoint. -->
+     delegates to it — the widget only ever talks to this one endpoint.
+     When this page is itself deployed on the same AMP gateway domain as the
+     agents (the AWS "chat-widget" component, served under
+     *.agents.<host>.sslip.io), default to a same-origin URL so the browser
+     never issues a cross-origin request in the first place — sidesteps the
+     gateway's CORS policy entirely instead of fighting it. Locally, fall
+     back to the known local gateway address. Either way this is just the
+     fallback: ?orchestrator=<url> in the page URL still overrides it. -->
 <script>
-  window.GRAND_MERIDIAN_ORCHESTRATOR_URL = "http://default-default.am-gateway.localhost:19080/concierge-orchestrator/chat";
+  window.GRAND_MERIDIAN_ORCHESTRATOR_URL = window.location.hostname.endsWith(".sslip.io")
+    ? window.location.origin + "/concierge-orchestrator/chat"
+    : "http://default-default.am-gateway.localhost:19080/concierge-orchestrator/chat";
 </script>
 </head>
 <body class="bg-white">
