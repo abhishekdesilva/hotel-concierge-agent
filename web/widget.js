@@ -9,40 +9,23 @@
 (() => {
   "use strict";
 
-  // Two backend agents, routed per message by intent, so one conversation
-  // hands off between them — the point being to watch both show up as
-  // separate traces in Agent Manager. Override via window.GRAND_MERIDIAN_*
-  // (set in index.html) for pointing at a different deployment.
-  const AVAILABILITY_URL =
-    window.GRAND_MERIDIAN_AVAILABILITY_URL ||
-    "http://default-default.am-gateway.localhost:19080/concierge-reader-only/chat";
-  const BOOKING_URL =
-    window.GRAND_MERIDIAN_BOOKING_URL ||
-    "http://default-default.am-gateway.localhost:19080/concierge-full-access/chat";
+  // A single backend: the orchestrator agent. It decides internally which
+  // of the two scope-gated concierge agents (reader-only vs full-access)
+  // should handle each message, delegates to it, and relays the reply back
+  // — the widget just talks to one endpoint. Override via
+  // window.GRAND_MERIDIAN_ORCHESTRATOR_URL (set in index.html).
+  const ORCHESTRATOR_URL =
+    window.GRAND_MERIDIAN_ORCHESTRATOR_URL ||
+    "http://default-default.am-gateway.localhost:19080/concierge-orchestrator/chat";
 
-  // Naive keyword classifier — good enough for a scripted demo. Two cases:
-  //   1. The message itself names the intent ("book", "booking", "reserve",
-  //      "reservation" — word-stem match, not just the bare word, so
-  //      "confirm the booking" and "I'd like to reserve" both count).
-  //   2. The availability agent just asked something like "would you like to
-  //      book this room?" and the guest replies with a bare confirmation
-  //      ("yes", "go ahead", "sounds good") that names no keyword at all —
-  //      tracked via awaitingBookingConfirmation, set after every reply.
-  // Anything else routes to the availability agent.
-  const BOOKING_STEM = /\bbook(ing|ed|s)?\b|\breserv(e|ed|ing|ation)\b/i;
-  const BOOKING_INVITE = /\b(would you like|shall i|do you want).{0,30}\bbook\b|\bbook (this|the) room\b|\blike (me )?to book\b/i;
-  const AFFIRMATIVE = /^\s*(yes|yeah|yep|yup|sure|please( do)?|go ahead|confirm(ed)?|sounds good|that works|do it|ok(ay)?|correct)\b/i;
-
-  let awaitingBookingConfirmation = false;
-
-  function classifyIntent(text) {
-    if (BOOKING_STEM.test(text)) return "booking";
-    if (awaitingBookingConfirmation && AFFIRMATIVE.test(text)) return "booking";
-    return "availability";
-  }
-
-  const AGENT_LABEL = { booking: "Booking Agent", availability: "Availability Agent" };
-  const AGENT_URL = { booking: BOOKING_URL, availability: AVAILABILITY_URL };
+  // Purely cosmetic: the orchestrator's response optionally names which
+  // delegate tool it routed to (routed_to), so the reply can still be
+  // tagged in the UI even though the widget itself makes no routing
+  // decision anymore.
+  const AGENT_LABEL = {
+    ask_booking_agent: "Booking Agent",
+    ask_availability_agent: "Availability Agent",
+  };
 
   const PANEL_W = 380;
   const PANEL_H = 560;
@@ -312,29 +295,19 @@
     send(text);
   });
 
-  // Full transcript across BOTH agents, resent as context.history on every
-  // request — this is what lets the receiving agent pick up mid-conversation
-  // even the first time it sees this session_id (see agent.py's history-seed
-  // logic), so switching agents mid-thread doesn't lose context.
-  const transcript = [];
-
   async function send(text) {
     renderUser(text);
     setSendingState(true);
     const typing = renderTyping();
 
-    const intent = classifyIntent(text);
-    const endpoint = AGENT_URL[intent];
-    const agentLabel = AGENT_LABEL[intent];
-
     try {
-      const res = await fetch(endpoint, {
+      const res = await fetch(ORCHESTRATOR_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           message: text,
           session_id: SESSION_ID,
-          context: { history: transcript },
+          context: {},
         }),
       });
       typing.remove();
@@ -345,8 +318,7 @@
       }
       const data = await res.json();
       const reply = (data && data.response) || "I'm having trouble — could you try again?";
-      transcript.push({ role: "user", content: text }, { role: "assistant", content: reply });
-      awaitingBookingConfirmation = intent === "availability" && BOOKING_INVITE.test(reply);
+      const agentLabel = data && AGENT_LABEL[data.routed_to];
       renderBot(reply, { agentLabel });
     } catch (err) {
       typing.remove();

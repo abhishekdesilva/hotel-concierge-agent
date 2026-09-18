@@ -40,12 +40,11 @@
   .room-2 { background-image: url('https://images.unsplash.com/photo-1611892440504-42a792e24d32?auto=format&fit=crop&w=1200&q=80'); }
   .room-3 { background-image: url('https://images.unsplash.com/photo-1582719508461-905c673771fd?auto=format&fit=crop&w=1200&q=80'); }
 </style>
-<!-- Configure the two deployed agent endpoints for the chat widget: one
-     handles availability/menu/recommendations, the other handles bookings.
-     widget.js routes each message to whichever fits, by keyword. -->
+<!-- Configure the orchestrator agent's endpoint. It decides internally which
+     of the two scope-gated concierge agents should handle each message and
+     delegates to it — the widget only ever talks to this one endpoint. -->
 <script>
-  window.GRAND_MERIDIAN_AVAILABILITY_URL = "http://default-default.am-gateway.localhost:19080/concierge-reader-only/chat";
-  window.GRAND_MERIDIAN_BOOKING_URL = "http://default-default.am-gateway.localhost:19080/concierge-full-access/chat";
+  window.GRAND_MERIDIAN_ORCHESTRATOR_URL = "http://default-default.am-gateway.localhost:19080/concierge-orchestrator/chat";
 </script>
 </head>
 <body class="bg-white">
