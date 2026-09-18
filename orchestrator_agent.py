@@ -52,8 +52,18 @@ FRIENDLY_FALLBACK = (
 # In-cluster chat endpoints of the two agents this orchestrator delegates
 # to. Set at deploy time (env vars, not hardcoded) so this same image works
 # against any pair of differently-scoped deployments.
+#
+# These point at the OpenChoreo data-plane gateway service, not the
+# downstream agents' own ClusterIP Services directly — a NetworkPolicy
+# refuses direct pod/Service-to-pod traffic between components ("connection
+# refused", confirmed by testing from inside this exact pod), so all
+# inter-agent calls have to go through the same gateway external callers
+# use. AGENT_GATEWAY_HOST is the Host header that gateway's routing rules
+# actually match on — the URL's own host is just the in-cluster Service
+# address, which the gateway doesn't route by.
 AVAILABILITY_AGENT_URL = os.environ.get("AVAILABILITY_AGENT_URL", "")
 BOOKING_AGENT_URL = os.environ.get("BOOKING_AGENT_URL", "")
+AGENT_GATEWAY_HOST = os.environ.get("AGENT_GATEWAY_HOST", "")
 
 SESSIONS: dict[str, list[BaseMessage]] = {}
 SESSION_LOCKS: dict[str, threading.Lock] = defaultdict(threading.Lock)
@@ -106,10 +116,12 @@ async def _delegate(agent_url: str, agent_label: str) -> str:
     if not agent_url:
         log.warning("no URL configured for %s agent", agent_label)
         return FRIENDLY_FALLBACK
+    headers = {"Host": AGENT_GATEWAY_HOST} if AGENT_GATEWAY_HOST else {}
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(
                 agent_url,
+                headers=headers,
                 json={
                     "message": ctx["message"],
                     "session_id": ctx["session_id"],
