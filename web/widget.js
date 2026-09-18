@@ -12,11 +12,37 @@
   // A single backend: the orchestrator agent. It decides internally which
   // of the two scope-gated concierge agents (reader-only vs full-access)
   // should handle each message, delegates to it, and relays the reply back
-  // — the widget just talks to one endpoint. Override via
-  // window.GRAND_MERIDIAN_ORCHESTRATOR_URL (set in index.html).
-  const ORCHESTRATOR_URL =
-    window.GRAND_MERIDIAN_ORCHESTRATOR_URL ||
-    "http://default-default.am-gateway.localhost:19080/concierge-orchestrator/chat";
+  // — the widget just talks to one endpoint.
+  //
+  // Resolution order: ?orchestrator=<url> query param (persisted to
+  // localStorage so it sticks across reloads; ?orchestrator=reset clears
+  // it) → window.GRAND_MERIDIAN_ORCHESTRATOR_URL (set in index.html) →
+  // local default. Lets the same static page point at either the local or
+  // an AWS-hosted deployment without editing files.
+  const ORCHESTRATOR_URL = (() => {
+    const LS_KEY = "gmOrchestratorUrl";
+    const fallback =
+      window.GRAND_MERIDIAN_ORCHESTRATOR_URL ||
+      "http://default-default.am-gateway.localhost:19080/concierge-orchestrator/chat";
+    let fromQuery = null;
+    try {
+      fromQuery = new URLSearchParams(window.location.search).get("orchestrator");
+    } catch (_) {}
+    if (fromQuery === "reset") {
+      try { localStorage.removeItem(LS_KEY); } catch (_) {}
+      return fallback;
+    }
+    if (fromQuery) {
+      try { new URL(fromQuery); } catch (_) { return fallback; }
+      try { localStorage.setItem(LS_KEY, fromQuery); } catch (_) {}
+      return fromQuery;
+    }
+    try {
+      const stored = localStorage.getItem(LS_KEY);
+      if (stored) { new URL(stored); return stored; }
+    } catch (_) {}
+    return fallback;
+  })();
 
   // Purely cosmetic: the orchestrator's response optionally names which
   // delegate tool it routed to (routed_to), so the reply can still be
