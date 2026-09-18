@@ -264,9 +264,17 @@
 
 <script>
 (function () {
+  // Same auto-detect as index.html: when this page is itself served from an
+  // AMP gateway domain (*.sslip.io), call the co-located agents same-origin
+  // so the browser never triggers a CORS preflight. Locally, fall back to
+  // the known local gateway address.
+  const GATEWAY_BASE = window.location.hostname.endsWith(".sslip.io")
+    ? window.location.origin
+    : "http://default-default.am-gateway.localhost:19080";
+
   const AGENTS = {
-    full:   { url: "http://default-default.am-gateway.localhost:19080/concierge-full-access/chat",  threadEl: document.getElementById("thread-full"),   sessionId: "compare-full-" + Math.random().toString(36).slice(2) },
-    reader: { url: "http://default-default.am-gateway.localhost:19080/concierge-reader-only/chat",   threadEl: document.getElementById("thread-reader"), sessionId: "compare-reader-" + Math.random().toString(36).slice(2) },
+    full:   { url: GATEWAY_BASE + "/concierge-full-access/chat",  threadEl: document.getElementById("thread-full"),   sessionId: "compare-full-" + Math.random().toString(36).slice(2) },
+    reader: { url: GATEWAY_BASE + "/concierge-reader-only/chat",   threadEl: document.getElementById("thread-reader"), sessionId: "compare-reader-" + Math.random().toString(36).slice(2) },
   };
 
   const DENIED_FALLBACK = "I'm having trouble reaching our systems right now — could you try that again in a moment?";
