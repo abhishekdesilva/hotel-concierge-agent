@@ -302,3 +302,95 @@ class TestStartupLifespanLogsReady:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestAgentIDAuthRefreshesToken:
+    """The MCP tools are built once per pod, so the bearer token must be
+    refreshed by the auth object itself. Without this, the token minted at
+    startup expires and every tool call 401s until the pod restarts — which
+    reads to guests as a permission denial on every request."""
+
+    @staticmethod
+    def _client(auth, statuses: list[int]):
+        """AsyncClient whose transport answers with `statuses` in order and
+        records the bearer token each request carried."""
+        import httpx
+
+        seen: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request.headers["Authorization"])
+            return httpx.Response(statuses[len(seen) - 1])
+
+        return httpx.AsyncClient(auth=auth, transport=httpx.MockTransport(handler)), seen
+
+    @staticmethod
+    def _minter(monkeypatch: pytest.MonkeyPatch, tokens: list[tuple[str, int]]) -> list[int]:
+        import agent as agent_module
+
+        calls: list[int] = []
+
+        def fake_mint(url: str):
+            calls.append(1)
+            return tokens[len(calls) - 1]
+
+        monkeypatch.setattr(agent_module, "_mint_mcp_token", fake_mint)
+        return calls
+
+    @pytest.mark.anyio
+    async def test_reuses_token_until_near_expiry(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import agent as agent_module
+
+        calls = self._minter(monkeypatch, [("t2", 3600)])
+        auth = agent_module._AgentIDAuth("https://gw/mcp", "t1", 3600)
+        client, seen = self._client(auth, [200, 200])
+        await client.post("https://gw/mcp")
+        await client.post("https://gw/mcp")
+        assert seen == ["Bearer t1", "Bearer t1"]
+        assert calls == []
+
+    @pytest.mark.anyio
+    async def test_remints_when_token_expired(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import agent as agent_module
+
+        calls = self._minter(monkeypatch, [("t2", 3600)])
+        # expires_in below the refresh skew -> already due for refresh
+        auth = agent_module._AgentIDAuth("https://gw/mcp", "t1", 1)
+        client, seen = self._client(auth, [200])
+        await client.post("https://gw/mcp")
+        assert seen == ["Bearer t2"]
+        assert len(calls) == 1
+
+    @pytest.mark.anyio
+    async def test_401_forces_one_remint_and_retry(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import agent as agent_module
+
+        self._minter(monkeypatch, [("t2", 3600)])
+        auth = agent_module._AgentIDAuth("https://gw/mcp", "t1", 3600)
+        client, seen = self._client(auth, [401, 200])
+        resp = await client.post("https://gw/mcp")
+        assert resp.status_code == 200
+        assert seen == ["Bearer t1", "Bearer t2"]
+
+    @pytest.mark.anyio
+    async def test_persistent_401_is_passed_through(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A genuine permission denial must still surface as 401 (not loop),
+        so chat() maps it to ACCESS_DENIED_FALLBACK."""
+        import agent as agent_module
+
+        self._minter(monkeypatch, [("t2", 3600)])
+        auth = agent_module._AgentIDAuth("https://gw/mcp", "t1", 3600)
+        client, seen = self._client(auth, [401, 401])
+        resp = await client.post("https://gw/mcp")
+        assert resp.status_code == 401
+        assert len(seen) == 2
+
+    @pytest.mark.anyio
+    async def test_failed_remint_keeps_old_token(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import agent as agent_module
+
+        monkeypatch.setattr(agent_module, "_mint_mcp_token", lambda url: None)
+        auth = agent_module._AgentIDAuth("https://gw/mcp", "t1", 1)
+        client, seen = self._client(auth, [200])
+        await client.post("https://gw/mcp")
+        assert seen == ["Bearer t1"]
