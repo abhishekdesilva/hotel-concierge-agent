@@ -75,15 +75,23 @@ _agent_lock = asyncio.Lock()
 HOTEL_TOOLS_MCP_URL_VAR = "HOTEL_TOOLS_URL"
 
 
-def _mint_mcp_token(mcp_server_url: str) -> str | None:
+# Refresh this many seconds before the token's stated expiry, so a token
+# never expires mid tool call. Also the assumed lifetime when the token
+# endpoint omits expires_in.
+TOKEN_REFRESH_SKEW_S = 60
+DEFAULT_TOKEN_LIFETIME_S = 300
+
+
+def _mint_mcp_token(mcp_server_url: str) -> tuple[str, int] | None:
     """Client-credentials grant against this agent's AgentID identity, scoped
     to mcp_server_url via RFC 8707's `resource` param. The token's scopes are
     filtered server-side to whatever roles are assigned to this agent's
     identity — a different agent hitting the same proxy can get a token with
     fewer scopes, which is the whole point of the demo.
 
-    Returns None (not raises) on any failure so a missing/misconfigured proxy
-    degrades to "no MCP tools available" rather than crashing agent startup.
+    Returns (access_token, expires_in_seconds), or None (not raises) on any
+    failure so a missing/misconfigured proxy degrades to "no MCP tools
+    available" rather than crashing agent startup.
     """
     client_id = os.environ.get("AMP_AGENTID_CLIENT_ID")
     client_secret = os.environ.get("AMP_AGENTID_CLIENT_SECRET")
@@ -100,10 +108,62 @@ def _mint_mcp_token(mcp_server_url: str) -> str | None:
             timeout=30,
         )
         resp.raise_for_status()
-        return resp.json()["access_token"]
+        body = resp.json()
+        return body["access_token"], int(body.get("expires_in") or DEFAULT_TOKEN_LIFETIME_S)
     except Exception as e:
         log.warning("failed to mint AgentID token for MCP proxy: %s", e)
         return None
+
+
+class _AgentIDAuth(httpx.Auth):
+    """Bearer auth for the MCP proxy that keeps its token fresh.
+
+    The agent (and its MCP tools) is built once and cached for the life of
+    the pod, so a token minted at startup used to be sent forever — once it
+    expired, every tool call 401'd until the pod restarted. Instead, the
+    token is cached until shortly before expiry and re-minted on demand, and
+    a 401 forces one re-mint + retry in case the proxy rejected it early.
+    A 401 that survives a fresh token is passed through untouched, so a real
+    permission denial still reaches chat()'s ACCESS_DENIED_FALLBACK path.
+    """
+
+    def __init__(self, mcp_server_url: str, token: str, expires_in: int):
+        self._url = mcp_server_url
+        self._lock = threading.Lock()
+        self._set(token, expires_in)
+
+    def _set(self, token: str, expires_in: int) -> None:
+        self._token = token
+        self._expires_at = time.monotonic() + max(expires_in - TOKEN_REFRESH_SKEW_S, 0)
+
+    def _current(self, force: bool = False) -> str:
+        # Blocking (requests) by design — runs at most once per token
+        # lifetime, and the async flow below calls it off the event loop.
+        with self._lock:
+            if force or time.monotonic() >= self._expires_at:
+                minted = _mint_mcp_token(self._url)
+                if minted is not None:
+                    self._set(*minted)
+                    log.info("refreshed AgentID token for MCP proxy (expires_in=%ss)", minted[1])
+                # On failure keep the old token; the proxy's 401 surfaces as
+                # an access denial rather than an opaque crash.
+            return self._token
+
+    def sync_auth_flow(self, request):
+        request.headers["Authorization"] = f"Bearer {self._current()}"
+        response = yield request
+        if response.status_code == 401:
+            request.headers["Authorization"] = f"Bearer {self._current(force=True)}"
+            yield request
+
+    async def async_auth_flow(self, request):
+        token = await asyncio.to_thread(self._current)
+        request.headers["Authorization"] = f"Bearer {token}"
+        response = yield request
+        if response.status_code == 401:
+            token = await asyncio.to_thread(self._current, True)
+            request.headers["Authorization"] = f"Bearer {token}"
+            yield request
 
 
 async def _get_mcp_tools() -> list[Any]:
@@ -115,16 +175,19 @@ async def _get_mcp_tools() -> list[Any]:
     if not mcp_url:
         log.warning("%s not set — MCP tools unavailable", HOTEL_TOOLS_MCP_URL_VAR)
         return []
-    token = _mint_mcp_token(mcp_url)
-    if not token:
+    minted = _mint_mcp_token(mcp_url)
+    if not minted:
         return []
     try:
+        # Each tool call opens its own MCP session through this connection
+        # config, so the shared auth object is consulted (and refreshes the
+        # token if needed) on every call, not just at discovery time.
         client = MultiServerMCPClient(
             {
                 "hotel_tools": {
                     "url": mcp_url,
                     "transport": "streamable_http",
-                    "headers": {"Authorization": f"Bearer {token}"},
+                    "auth": _AgentIDAuth(mcp_url, *minted),
                 }
             }
         )
